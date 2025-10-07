@@ -1,0 +1,302 @@
+import argparse
+import socket
+import threading
+import concurrent.futures
+import time
+from typing import List, Tuple, Optional
+import hashlib
+import os
+from urllib.parse import urljoin
+import sys
+
+# Optional dependency for HTTP tests - import only when needed
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    HAS_REQUESTS = True
+except Exception:
+    HAS_REQUESTS = False
+
+# Utilities
+def banner(msg: str):
+    print(f"\n=== {msg} ===\n")
+
+
+def hostname_to_ip(host: str) -> str:
+    try:
+        return socket.gethostbyname(host)
+    except socket.gaierror:
+        raise ValueError(f"Unable to resolve host: {host}")
+
+# Port Scanner Module
+def scan_port(host: str, port: int, timeout: float = 1.0) -> Tuple[int, bool]:
+    """Attempt a TCP connect to host:port. Returns (port, open)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        result = s.connect_ex((host, port))
+        s.close()
+        return (port, result == 0)
+    except Exception:
+        return (port, False)
+
+
+def port_scan(host: str, ports: List[int], workers: int = 100, timeout: float = 1.0) -> List[int]:
+    """
+    Threaded port scanner using connect() (safe, requires no raw sockets).
+    Returns list of open ports.
+    """
+    ip = hostname_to_ip(host)
+    open_ports = []
+
+    def _scan(p):
+        port, is_open = scan_port(ip, p, timeout)
+        if is_open:
+            print(f"[OPEN] {host}:{port}")
+            return port
+        else:
+            return None
+
+    banner(f"Port scan: {host} ({ip})")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_scan, p) for p in ports]
+        for fut in concurrent.futures.as_completed(futures):
+            res = fut.result()
+            if res:
+                open_ports.append(res)
+    return sorted(open_ports)
+
+# Banner Grabber Module
+def grab_banner(host: str, port: int, timeout: float = 2.0) -> Optional[str]:
+    """
+    Connect and try to read a service banner. Works best for plain-text protocols
+    (HTTP will usually require an HTTP request for a meaningful response).
+    """
+    try:
+        ip = hostname_to_ip(host)
+        s = socket.socket()
+        s.settimeout(timeout)
+        s.connect((ip, port))
+        try:
+            s.sendall(b"\r\n")
+        except Exception:
+            pass
+        data = s.recv(4096)
+        s.close()
+        try:
+            return data.decode(errors="replace").strip()
+        except Exception:
+            return repr(data)
+    except Exception as e:
+        return None
+
+# HTTP Vulnerability Scanner
+SQL_ERRORS = [
+    "you have an error in your sql syntax",
+    "warning: mysql",
+    "unclosed quotation mark",
+    "quoted string not properly terminated",
+    "sql syntax",
+    "mysql_fetch",
+    "syntax error"
+]
+
+
+def get_all_forms(url: str) -> List:
+    if not HAS_REQUESTS:
+        raise RuntimeError("requests and bs4 are required for HTTP tests. Install with: pip install requests beautifulsoup4")
+    r = requests.get(url, timeout=10)
+    soup = BeautifulSoup(r.content, "html.parser")
+    return soup.find_all("form")
+
+
+def parse_form(form) -> dict:
+    details = {}
+    action = form.attrs.get("action")
+    method = form.attrs.get("method", "get").lower()
+    inputs = []
+    for inp in form.find_all(["input", "textarea", "select"]):
+        itype = inp.attrs.get("type", "text")
+        name = inp.attrs.get("name")
+        if name:
+            inputs.append({"type": itype, "name": name})
+    details["action"] = action
+    details["method"] = method
+    details["inputs"] = inputs
+    return details
+
+
+def http_test_xss(base_url: str) -> List[str]:
+    """Test for reflected XSS by submitting a benign script payload and checking reflection."""
+    if not HAS_REQUESTS:
+        raise RuntimeError("requests and bs4 required.")
+    results = []
+    forms = get_all_forms(base_url)
+    banner(f"HTTP XSS test on {base_url}: found {len(forms)} form(s)")
+    payload = "<script>alert('xss')</script>"
+    for f in forms:
+        details = parse_form(f)
+        target = urljoin(base_url, details["action"] or "")
+        data = {}
+        for inp in details["inputs"]:
+            # fill only named fields
+            if inp["type"] in ["text", "search", "textarea", ""]:
+                data[inp["name"]] = payload
+            else:
+                data[inp["name"]] = "test"
+        try:
+            if details["method"] == "post":
+                r = requests.post(target, data=data, timeout=10)
+            else:
+                r = requests.get(target, params=data, timeout=10)
+            if payload in r.text:
+                msg = f"[XSS] Reflected XSS detected at {target} (form param sample: {list(data.keys())[:3]})"
+                print(msg)
+                results.append(msg)
+            else:
+                print(f"[OK] No reflected XSS found on {target}")
+        except Exception as e:
+            print(f"[ERR] Request failed for {target}: {e}")
+    return results
+
+
+def http_test_sqli(base_url: str) -> List[str]:
+    """Basic SQLi detection by sending common payloads and looking for SQL error strings."""
+    if not HAS_REQUESTS:
+        raise RuntimeError("requests and bs4 required.")
+    results = []
+    forms = get_all_forms(base_url)
+    banner(f"HTTP SQLi test on {base_url}: found {len(forms)} form(s)")
+    payloads = ["' OR '1'='1", "' OR 1=1--", "\" OR \"\" = \""]
+    for f in forms:
+        details = parse_form(f)
+        target = urljoin(base_url, details["action"] or "")
+        for p in payloads:
+            data = {}
+            for inp in details["inputs"]:
+                data[inp["name"]] = p
+            try:
+                if details["method"] == "post":
+                    r = requests.post(target, data=data, timeout=10)
+                else:
+                    r = requests.get(target, params=data, timeout=10)
+                body = r.text.lower()
+                for err in SQL_ERRORS:
+                    if err in body:
+                        msg = f"[SQLi] Possible SQL injection at {target} with payload {p}"
+                        print(msg)
+                        results.append(msg)
+                        raise StopIteration  # stop payload loop if found
+                print(f"[OK] No obvious SQL errors for payload on {target}")
+            except StopIteration:
+                break
+            except Exception as e:
+                print(f"[ERR] Request failed for {target}: {e}")
+    return results
+
+# Offline Password Cracker (safe)
+def crack_sha256_hash(target_hash: str, wordlist_path: str) -> Optional[str]:
+    """
+    Offline cracker: tries to find a plaintext in the wordlist whose SHA256 matches target_hash.
+    This is safe: it does not perform any network requests.
+    """
+    if not os.path.exists(wordlist_path):
+        raise FileNotFoundError("Wordlist not found: " + wordlist_path)
+    banner(f"Offline SHA256 cracking (wordlist: {wordlist_path})")
+    with open(wordlist_path, "rb") as f:
+        for line in f:
+            pw = line.rstrip(b"\r\n")
+            h = hashlib.sha256(pw).hexdigest()
+            if h == target_hash:
+                return pw.decode(errors="ignore")
+    return None
+
+# CLI & Main
+def parse_ports(ports_str: str) -> List[int]:
+    """
+    Parse ports like: "22,80,443" or "1-1024" or mix "22,80,1000-1010"
+    """
+    ports = set()
+    parts = ports_str.split(",")
+    for part in parts:
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            ports.update(range(int(a), int(b) + 1))
+        else:
+            ports.add(int(part))
+    return sorted([p for p in ports if 0 < p < 65536])
+
+
+def main():
+    parser = argparse.ArgumentParser(description="pentoolkit - modular penetration testing toolkit (lab use only)")
+    sub = parser.add_subparsers(dest="module", help="Module to run")
+
+    # Port scan
+    p_scan = sub.add_parser("portscan", help="TCP connect port scanner")
+    p_scan.add_argument("host", help="Target hostname or IP")
+    p_scan.add_argument("--ports", default="1-1024", help="Ports (e.g. 22,80,443 or 1-1024)")
+    p_scan.add_argument("--workers", type=int, default=200, help="Thread workers")
+    p_scan.add_argument("--timeout", type=float, default=0.6, help="Connect timeout seconds")
+
+    # Banner
+    p_banner = sub.add_parser("banner", help="Banner grabber")
+    p_banner.add_argument("host", help="Target hostname or IP")
+    p_banner.add_argument("port", type=int, help="Port to grab banner from")
+    p_banner.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds")
+
+    # HTTP tests
+    p_http = sub.add_parser("http", help="HTTP vulnerability scanner (requires requests & bs4)")
+    p_http.add_argument("url", help="Target URL (include http:// or https://)")
+    p_http.add_argument("--xss", action="store_true", help="Test for reflected XSS")
+    p_http.add_argument("--sqli", action="store_true", help="Test for basic SQL injection")
+    p_http.add_argument("--consent", action="store_true", help="I have permission to test this target (required for network tests)")
+
+    # Offline password cracker
+    p_pass = sub.add_parser("crack", help="Offline SHA256 password cracker (safe, no network)")
+    p_pass.add_argument("hash", help="Target SHA256 hash (hex)")
+    p_pass.add_argument("wordlist", help="Path to wordlist file (one password per line)")
+
+    args = parser.parse_args()
+
+    if args.module == "portscan":
+        ports = parse_ports(args.ports)
+        open_ports = port_scan(args.host, ports, workers=args.workers, timeout=args.timeout)
+        banner(f"Scan complete: open ports on {args.host}")
+        for p in open_ports:
+            b = grab_banner(args.host, p)
+            if b:
+                print(f"  {p} -> {b[:200]}")
+            else:
+                print(f"  {p} -> (no banner)")
+    elif args.module == "banner":
+        b = grab_banner(args.host, args.port, timeout=args.timeout)
+        if b:
+            print(f"Banner: {b}")
+        else:
+            print("No banner or connection failed.")
+    elif args.module == "http":
+        if not args.consent:
+            print("ERROR: HTTP network tests require --consent (must have authorization). Exiting.")
+            sys.exit(1)
+        if not HAS_REQUESTS:
+            print("ERROR: requests and bs4 are required. Install with: pip install requests beautifulsoup4")
+            sys.exit(1)
+        if args.xss:
+            http_test_xss(args.url)
+        if args.sqli:
+            http_test_sqli(args.url)
+        if (not args.xss) and (not args.sqli):
+            print("No test selected. Use --xss and/or --sqli.")
+    elif args.module == "crack":
+        res = crack_sha256_hash(args.hash.lower(), args.wordlist)
+        if res:
+            print(f"[FOUND] Plaintext password: {res}")
+        else:
+            print("[NOT FOUND] No matching password in wordlist.")
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
